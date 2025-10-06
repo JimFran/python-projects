@@ -40,9 +40,9 @@ with open(PRIVATE_KEY_PATH, "r") as f:
 def create_jwt():
     payload = {
         # Issued at time
-        "iat": int(time.time()),
+        "iat": int(time.time()) - 30,
         # Expiration time 10 min. maximum (600 seconds)
-        "exp": int(time.time()) + 600,
+        "exp": int(time.time()) + 540,
         # Github APP ID
         "iss": APP_ID
     }
@@ -86,6 +86,20 @@ def is_title_ok(pr_title):
             return True
     return False
 
+################################
+# Verify commit messages title #
+################################
+def get_invalid_commits(commits):
+    
+    valid_keywords = ["feat", "fix", "docs", "style", "refactor", "test", "chore"]
+    
+    invalid = []
+    for commit in commits:
+        message = commit['commit']['message'].lower()
+        if not any(k in message for k in valid_keywords):
+            invalid.append(message)
+    return invalid  # empty list if commit is valid
+
 ##################################
 # Payload signature verification #
 ##################################
@@ -120,9 +134,10 @@ def verify_signature(webhook_payload_body, webhook_signature):
 # Function to create the check_run in the PRs
 # https://docs.github.com/en/rest/checks/runs?apiVersion=2022-11-28#create-a-check-run
 
-def create_check(pr_commit_sha, full_repo_name, installation_id, is_title_ok):
+def create_check(pr_commit_sha, full_repo_name, installation_id, title_ok, invalid_commits):
     # First we need the installation ID to create the installation token
     installation_token = create_installation_token(installation_id)
+
     url = f"https://api.github.com/repos/{full_repo_name}/check-runs"
     headers = {
         "Authorization": f"Bearer {installation_token}",
@@ -130,10 +145,10 @@ def create_check(pr_commit_sha, full_repo_name, installation_id, is_title_ok):
     }
     
     status = "completed"
-    conclusion = "success" if is_title_ok else "failure"
+    conclusion = "success" if title_ok and not invalid_commits else "failure"
 
     in_progress_data = {
-        "name": "Title Check",
+        "name": "PR Title & Commit Messages Check",
         "head_sha": pr_commit_sha,
         "status": "in_progress"
     }
@@ -143,18 +158,36 @@ def create_check(pr_commit_sha, full_repo_name, installation_id, is_title_ok):
     check_run_id = response.json()["id"]
     print("Check_run created in-progress:", response.json()["html_url"])
 
+    summary_lines = []
+
+    if title_ok:
+        summary_lines.append("PR title is valid.")
+    else:
+        summary_lines.append("PR title is invalid.")
+
+    if not invalid_commits:
+        summary_lines.append("All commit messages are valid.")
+    else:
+        summary_lines.append("Invalid commit messages found:")
+        for msg in invalid_commits:
+            summary_lines.append(f"- {msg}")
+
+    summary = "\n".join(summary_lines)
+
     completed_data = {
         "status": status,
         "conclusion": conclusion,
         "output": {
-            "title": "PR Title Check",
-            "summary": "The PR title is valid" if is_title_ok else "The PR title is invalid"
+            "title": "PR Title & Commit Messages Check",
+            "summary": summary
         }
     }
+
     update_url = f"{url}/{check_run_id}"
     response = requests.patch(update_url, json=completed_data, headers=headers)
     response.raise_for_status()
     print("Check_run completed:", response.json()["html_url"])
+
 
 ####################
 # Webhook endpoint #
@@ -178,32 +211,63 @@ def webhook():
     
     print(f"JSON payload: {json_payload}")
     print(f"Webhook event received: {webhook_event}")
-    
+
     # Webhook type event pull_request
     # https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request
     if webhook_event == "pull_request":
+        action = json_payload.get("action") 
+        if action not in ["opened", "synchronize"]:
+            print(f"Ignoring pull_request action {action}")
+            return "[OK]", 200  # We don't perform any action
         # Title of the PR
         pr_title=json_payload['pull_request']['title']
         print(f"PR detecetd: {pr_title}")
+
         # PR commit SHA
         pr_commit_sha=json_payload['pull_request']['head']['sha']
         print(f"PR commit SHA: {pr_commit_sha}")
+
         # Installation ID
         # https://stackoverflow.com/questions/74462420/where-can-we-find-github-apps-installation-id
         installation_id=INSTALLATION_ID
         print(f"Installation ID: {installation_id}")
 
+        # We get the commits from the Pull request
+        # https://docs.github.com/en/rest/pulls/pulls?apiVersion=2022-11-28#list-commits-on-a-pull-request
+        commits_url = json_payload['pull_request']['commits_url']
+        print(f"Commits URL: {commits_url}")
+
+        headers = {
+            "Authorization": f"Bearer {create_installation_token(installation_id)}",
+            "Accept": "application/vnd.github+json"
+        }
+
+        commits_response = requests.get(commits_url, headers=headers)
+        commits_response.raise_for_status()
+        commits = commits_response.json()
+
+        # We verify commit messages
+        invalid_commits = get_invalid_commits(commits)
+        print(f"Invalid commits: {invalid_commits}")
+
         try:
-          create_check(pr_commit_sha, FULL_REPO_NAME, installation_id, is_title_ok(pr_title))
+            create_check(
+                pr_commit_sha,
+                FULL_REPO_NAME,
+                installation_id,
+                is_title_ok(pr_title),
+                invalid_commits
+            )
         except requests.exceptions.HTTPError as e:
-          print(f"Error creating the check_run: {e.response.text}")
-          return f"[ERROR creating check_run] {e.response.text}", 500
-        
+            print(f"Error creating the check_run: {e.response.text}")
+            return f"[ERROR creating check_run] {e.response.text}", 500
+
     else:
         print(f"Webhook Event ignored")
 
     # We return [OK], 200 to the client, in this case Github
     return "[OK]", 200
+
 
 # We start a Flask server locally on port 3000
 if __name__ == "__main__":
